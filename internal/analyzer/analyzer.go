@@ -269,8 +269,74 @@ func (a Bidi) Analyze(path string, content []byte) []Finding {
 // que variantes como "CURL ... | SH" no esquiven la regla (PowerShell, además,
 // es insensible a mayúsculas por diseño).
 var (
+	// reDownload detecta herramientas o funciones que descargan contenido
+	// remoto:
+	//   - curl, wget                → Unix/Linux/macOS.
+	//   - iwr, Invoke-WebRequest    → PowerShell (iwr es el alias corto).
+	//   - DownloadString            → método de System.Net.WebClient en
+	//                                 PowerShell/.NET, muy usado en
+	//                                 one-liners maliciosos.
+	//
+	// Los \b (límite de palabra) evitan coincidencias dentro de otras
+	// palabras (por ejemplo, "libcurlx" no coincide con "curl").
 	reDownload = regexp.MustCompile(`(?i)\b(curl|wget|iwr|Invoke-WebRequest|DownloadString)\b`)
-	reExec     = regexp.MustCompile(`(?i)(\|\s*(sudo\s+(-[a-z0-9-]+\s+)*)?(/[a-z0-9._-]+/)?(sh|bash|zsh)\b|\b(sh|bash|zsh)\s+(-c\s+)?["']?(\$\(|<\()|\b(iex|Invoke-Expression)\b)`)
+
+	// reExec detecta que el contenido descargado se ejecuta directamente.
+	// Es una alternancia (A|B|C) de tres formas de ejecución:
+	//
+	// A) Tubería hacia un shell:
+	//
+	//	\|\s*(sudo\s+(-[a-z0-9-]+\s+)*)?(/[a-z0-9._-]+/)?(sh|bash|zsh)\b
+	//
+	//	   \|\s*                    un "|" seguido de espacios opcionales.
+	//	   (sudo\s+(-[a-z0-9-]+\s+)*)?
+	//	                            sudo opcional, con cero o más flags SIN
+	//	                            valor detrás ("-E", "-H", "--preserve-env").
+	//	   (/[a-z0-9._-]+/)?        un único directorio absoluto opcional
+	//	                            delante del shell ("/bin/").
+	//	   (sh|bash|zsh)\b          el intérprete. El \b final hace que
+	//	                            "| shasum" o "| /usr/bin/shasum" NO
+	//	                            coincidan.
+	//
+	//	Ejemplos que coinciden: "| sh", "|bash", "| sudo bash",
+	//	"| sudo -E bash", "| /bin/bash".
+	//
+	// B) Shell que recibe el script por sustitución de comandos o procesos
+	// (sin "|" en la línea; es la forma que usa, por ejemplo, Homebrew):
+	//
+	//	\b(sh|bash|zsh)\s+(-c\s+)?["']?(\$\(|<\()
+	//
+	//	   (sh|bash|zsh)\s+         el intérprete seguido de espacios.
+	//	   (-c\s+)?                 el flag -c opcional.
+	//	   ["']?                    comilla opcional ("$(...)" suele ir citado).
+	//	   (\$\(|<\()               inmediatamente $( (sustitución de comandos)
+	//	                            o <( (sustitución de procesos).
+	//
+	//	Ejemplos: `bash -c "$(curl ...)"`, `sh -c "$(wget -qO- ...)"`,
+	//	`bash <(curl ...)`.
+	//
+	//	Exigir que el $( o <( vaya JUSTO después del shell es lo que evita
+	//	falsos positivos como `curl -o x.sh URL && echo "$(cat x.sh)"`, donde
+	//	aparecen "sh" y "$(" en la misma línea pero nada ejecuta lo
+	//	descargado.
+	//
+	// C) PowerShell:
+	//
+	//	\b(iex|Invoke-Expression)\b
+	//
+	//	Invoke-Expression (alias iex) evalúa una cadena como código. Cubre
+	//	"iex (...DownloadString(...))" y "iwr ... | iex".
+	//
+	// Limitaciones conocidas (posibles evasiones aún no cubiertas):
+	//   - Rutas con más de un directorio tras el "|": "| /usr/bin/bash" o
+	//     "| /usr/local/bin/zsh" no coinciden, porque (/[a-z0-9._-]+/)? solo
+	//     admite un segmento.
+	//   - Flags de sudo con valor: "| sudo -u root bash" no coincide, porque
+	//     "root" no empieza por "-".
+	//   - Otros intérpretes (python, perl, node, dash, ksh, fish...) o
+	//     "| env bash" no están contemplados.
+	//   - Descarga y ejecución en líneas separadas (ver DownloadExec).
+	reExec = regexp.MustCompile(`(?i)(\|\s*(sudo\s+(-[a-z0-9-]+\s+)*)?(/[a-z0-9._-]+/)?(sh|bash|zsh)\b|\b(sh|bash|zsh)\s+(-c\s+)?["']?(\$\(|<\()|\b(iex|Invoke-Expression)\b)`)
 )
 
 // DownloadExec detecta líneas que descargan contenido de Internet y lo
@@ -297,13 +363,20 @@ var (
 //     genera hallazgo. Esto reduce falsos positivos, a costa de no detectar
 //     casos en que la descarga y la ejecución están en líneas separadas.
 //   - Como máximo un hallazgo por línea.
+//
+// Variantes cubiertas además de las anteriores (ver reExec para el detalle):
+//
+//	curl -fsSL https://ejemplo.com/i.sh | /bin/bash
+//	curl https://ejemplo.com/i.sh | sudo -E bash
+//	/bin/bash -c "$(curl -fsSL https://ejemplo.com/install.sh)"
+//	sh -c "$(wget -qO- https://ejemplo.com/i.sh)"
+//	bash <(curl -s https://ejemplo.com/i.sh)
 type DownloadExec struct{}
 
-// Name devuelve el identificador de la regla.
+// Name devuelve el identificador de la regla: "download-exec".
 //
-// Nota: el valor actual es "download-exec" (falta una "n"). Se documenta tal
-// cual porque es el identificador que aparece en los hallazgos; si se
-// corrige, hay que tener en cuenta que cambia el valor de Finding.Rule.
+// Este valor se copia en Finding.Rule; cambiarlo afecta a cualquier filtro
+// o configuración que dependa del nombre de la regla (y a TestAll).
 func (DownloadExec) Name() string {
 	return "download-exec"
 }
@@ -373,6 +446,13 @@ var reNetCmd = regexp.MustCompile(`(?i)\b(curl|wget)\b`)
 //     (en cualquier directorio, incluidos los de dependencias anidadas).
 //   - Si el JSON es inválido, lo ignora silenciosamente (no es tarea de este
 //     analizador validar la sintaxis).
+//   - Tolera scripts que no son strings: si OTRO script del objeto "scripts"
+//     es un número, array, objeto, etc., se sigue analizando el resto (npm
+//     hace lo mismo: ignora el valor inválido y ejecuta los hooks válidos).
+//     Esto evita una evasión en la que un atacante añade algo como
+//     `"x": 1` para que el parseo falle y el postinstall pase desapercibido.
+//   - Si el propio hook no es un string (por ejemplo `"postinstall": 123`),
+//     no se reporta: npm no tiene ningún comando que ejecutar.
 //   - Los hallazgos se reportan con Line = 0, porque tras parsear el JSON no
 //     se conoce la línea original del script; el hallazgo aplica al archivo.
 //   - El mensaje incluye el nombre del hook y el comando completo, para que
@@ -395,12 +475,21 @@ func (a InstallHooks) Analyze(path string, content []byte) []Finding {
 	// Struct anónimo con solo el campo que interesa. encoding/json ignora el
 	// resto de claves del package.json (name, version, dependencies, ...),
 	// lo que hace el parseo más simple y tolerante.
+	//
+	// Scripts se decodifica como map[string]any y NO como map[string]string
+	// a propósito: con map[string]string, un solo valor que no sea string
+	// (p. ej. `"x": 1` o `"x": ["a"]`) hace que json.Unmarshal devuelva error
+	// y el analizador no reportaría nada, aunque npm sí ejecutaría los hooks.
+	// Con any, cada valor se decodifica a su tipo natural de Go (string,
+	// float64, []any, map[string]any, bool o nil) y luego se filtran solo
+	// los strings (ver el type assertion más abajo).
 	var pkg struct {
 		Scripts map[string]any `json:"scripts"`
 	}
 
-	// Si el JSON está mal formado (o "scripts" no es un objeto de strings),
-	// no se puede analizar: se devuelve nil sin reportar error.
+	// Unmarshal solo falla ahora si el JSON está mal formado o si "scripts"
+	// existe pero no es un objeto (por ejemplo, un string o un array). En
+	// ese caso no se puede analizar: se devuelve nil sin reportar error.
 	if err := json.Unmarshal(content, &pkg); err != nil {
 		return nil
 	}
@@ -418,10 +507,15 @@ func (a InstallHooks) Analyze(path string, content []byte) []Finding {
 	// Leer de un map nil (si el package.json no tiene "scripts") es seguro en
 	// Go: simplemente devuelve ok == false.
 	for _, hook := range []string{"preinstall", "install", "postinstall"} {
+		// raw es de tipo any: puede contener cualquier valor JSON.
 		raw, ok := pkg.Scripts[hook]
 		if !ok {
 			continue
 		}
+
+		// Type assertion con la forma "comma ok": si raw no es un string,
+		// ok es false (en lugar de entrar en pánico) y el hook se ignora,
+		// porque npm no tendría ningún comando que ejecutar.
 		cmd, ok := raw.(string)
 		if !ok {
 			continue // Si el hook es un número, array, etc., lo ignoramos

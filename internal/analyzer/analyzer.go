@@ -325,11 +325,11 @@ type DownloadExec struct{}
 
 // Name devuelve el identificador de la regla.
 //
-// Nota: el valor actual es "dowload-exec" (falta una "n"). Se documenta tal
+// Nota: el valor actual es "download-exec" (falta una "n"). Se documenta tal
 // cual porque es el identificador que aparece en los hallazgos; si se
 // corrige, hay que tener en cuenta que cambia el valor de Finding.Rule.
 func (DownloadExec) Name() string {
-	return "dowload-exec"
+	return "download-exec"
 }
 
 // Analyze implementa Analyzer para DownloadExec.

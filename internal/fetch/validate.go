@@ -16,6 +16,14 @@ var allowedHosts = map[string]bool{"github.com": true, "gitlab.com": true}
 // (letras, números, punto, guion y guion bajo).
 var segment = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
+var ErrScheme = errors.New("solo se permite HTTPS")
+var ErrPort = errors.New("no se permiten puertos explícitos")
+var ErrUser = errors.New("no se permiten credenciales, queries o fragmentos")
+var ErrPath = errors.New("URL debe tener al menos el owner y el repo")
+var ErrSegment = errors.New("segmento invalido")
+var ErrHost = errors.New("host no permitido")
+var ErrGitHub = errors.New("los repositorios de GitHub deben tener exactamente owner y repo")
+
 // ValidateURL valida que raw sea una URL de repositorio segura y devuelve
 // su forma canónica: "https://<host>/<owner>/<repo>.git".
 //
@@ -37,20 +45,20 @@ func ValidateURL(raw string) (string, error) {
 	}
 
 	if u.Scheme != "https" {
-		return "", errors.New("solo se permite HTTPS")
+		return "", ErrScheme
 	}
 
 	host := strings.ToLower(u.Hostname())
 	if !allowedHosts[host] {
-		return "", fmt.Errorf("host no permitido: %s", u.Hostname())
+		return "", fmt.Errorf("%s: %s", ErrHost, host)
 	}
 
 	if u.Port() != "" {
-		return "", errors.New("no se permiten puertos explícitos")
+		return "", ErrPort
 	}
 
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return "", errors.New("no se permiten credenciales, queries o fragmentos")
+		return "", ErrUser
 	}
 
 	// Normaliza el path: quita barras sobrantes y el sufijo ".git" opcional.
@@ -61,19 +69,19 @@ func ValidateURL(raw string) (string, error) {
 	parts := strings.Split(cleanPath, "/")
 
 	if len(parts) < 2 {
-		return "", errors.New("URL debe tener al menos el owner y el repo")
+		return "", ErrPath
 	}
 
 	// Valida cada segmento contra la regex y rechaza "." y "..".
 	for _, p := range parts {
 		if !segment.MatchString(p) || p == "." || p == ".." {
-			return "", fmt.Errorf("segmento invalido %q", p)
+			return "", fmt.Errorf("%w: %q", ErrSegment, p)
 		}
 	}
 
 	// Github: exactamente owner/repo. Gitlab permite subgrupos
 	if host == "github.com" && len(parts) != 2 {
-		return "", errors.New("los repositorios de GitHub deben tener exactamente owner y repo")
+		return "", ErrGitHub
 	}
 
 	// Reconstruye la URL canónica con host en minúsculas y sufijo ".git".

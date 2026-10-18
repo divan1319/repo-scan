@@ -35,8 +35,10 @@ package analyzer
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"math"
 	"net/url"
@@ -1031,6 +1033,134 @@ func isVowel(c byte) bool {
 	return false
 }
 
+// ---------------------------------------------------------------------------
+// Bloques PEM (certificados y llaves)
+// ---------------------------------------------------------------------------
+//
+// PEM es el formato de texto de certificados y llaves: base64 entre una
+// línea BEGIN y una END con el mismo tipo. El base64 de un certificado es
+// datos binarios codificados, así que Entropy marcaría cada línea, aunque un
+// certificado es información PÚBLICA.
+//
+// Entropy se salta las líneas de un bloque PEM solo en dos casos:
+//
+//  1. Tipos públicos (CERTIFICATE, PUBLIC KEY, CERTIFICATE REQUEST) cuyo
+//     contenido SE DECODIFICA DE VERDAD como ese tipo. Si solo miráramos
+//     las líneas BEGIN/END, bastaría con envolver cualquier payload en ellas
+//     para que Entropy no lo viera. Con la validación, un "certificado" que
+//     no es un certificado se sigue analizando línea por línea.
+//
+//  2. Llaves privadas (cualquier tipo "... PRIVATE KEY"). Aquí no hace falta
+//     validar: el analizador PrivateKey ya reporta el bloque como High. Si
+//     alguien disfrazara un payload de llave privada, se reportaría igual,
+//     y con severidad mayor. Saltarse sus líneas en Entropy solo evita
+//     repetir 25 hallazgos medium para algo que ya tiene uno high.
+//
+// Así ningún bloque queda sin cubrir: o lo reporta Entropy, o PrivateKey, o
+// se demostró que es un certificado o llave pública válidos.
+//
+// Limitación: el PEM escrito en una sola línea con "\n" escapados (común en
+// JSON o variables de entorno) no se reconoce como bloque y se sigue
+// reportando.
+
+// maxPEMLines limita cuántas líneas buscamos el END de un bloque.
+//
+// Sin este límite, un archivo con miles de líneas BEGIN sin su END haría que
+// cada una recorriera el resto del archivo: tiempo cuadrático. Con 70,000
+// líneas (un archivo de 2 MB) serían miles de millones de comparaciones: un
+// archivo diseñado para colgar el escáner. Una llave RSA de 16,384 bits
+// ocupa menos de 300 líneas, así que 2,000 sobra.
+const maxPEMLines = 2000
+
+// rePEMBegin reconoce la línea de inicio y captura el tipo del bloque.
+var rePEMBegin = regexp.MustCompile(`^-----BEGIN ([A-Z0-9 ]+)-----$`)
+
+// rePrivateKeyType reconoce los tipos de llave privada: "PRIVATE KEY",
+// "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY",
+// "ENCRYPTED PRIVATE KEY", "PGP PRIVATE KEY BLOCK"...
+//
+// (?:...) es un grupo que NO captura: agrupa para aplicar el * sin crear un
+// submatch que no vamos a usar.
+var rePrivateKeyType = regexp.MustCompile(`^(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?$`)
+
+// pemSkipLines devuelve, para cada línea, si Entropy debe saltarla porque
+// pertenece a un bloque PEM aceptado (ver reglas arriba).
+func pemSkipLines(lines [][]byte) []bool {
+	skip := make([]bool, len(lines))
+
+	for i := 0; i < len(lines); i++ {
+		// TrimSpace tolera indentación (PEM dentro de YAML) y el \r de los
+		// finales de línea de Windows.
+		m := rePEMBegin.FindSubmatch(bytes.TrimSpace(lines[i]))
+		if m == nil {
+			continue
+		}
+		typ := string(m[1])
+
+		// Buscamos el END del MISMO tipo, con el límite de líneas.
+		// min es una función incorporada desde Go 1.21.
+		endLine := []byte("-----END " + typ + "-----")
+		end := -1
+		limit := min(len(lines), i+maxPEMLines)
+		for j := i + 1; j < limit; j++ {
+			if bytes.Equal(bytes.TrimSpace(lines[j]), endLine) {
+				end = j
+				break
+			}
+		}
+		if end == -1 {
+			// Bloque sin cerrar (o END de otro tipo): no se salta nada.
+			continue
+		}
+
+		block := lines[i : end+1]
+		if rePrivateKeyType.MatchString(typ) || isValidPublicPEM(block, typ) {
+			for k := i; k <= end; k++ {
+				skip[k] = true
+			}
+		}
+		// Seguimos buscando después del END, sea cual sea el resultado.
+		i = end
+	}
+	return skip
+}
+
+// isValidPublicPEM indica si las líneas de block (de BEGIN a END) forman un
+// bloque PEM válido de tipo typ, y si su contenido se puede interpretar como
+// ese tipo de objeto.
+func isValidPublicPEM(block [][]byte, typ string) bool {
+	// Quitamos la indentación de cada línea antes de unirlas: pem.Decode
+	// espera que "-----BEGIN" esté al inicio de una línea.
+	trimmed := make([][]byte, len(block))
+	for k, l := range block {
+		trimmed[k] = bytes.TrimSpace(l)
+	}
+
+	// pem.Decode devuelve el primer bloque encontrado y el resto del texto.
+	// No necesitamos el resto: le pasamos exactamente un bloque.
+	p, _ := pem.Decode(bytes.Join(trimmed, []byte("\n")))
+	if p == nil || p.Type != typ {
+		// nil = base64 inválido u otro problema de formato.
+		return false
+	}
+
+	// p.Bytes es el contenido ya decodificado (DER, un formato binario).
+	// Cada Parse valida que esos bytes sean de verdad ese tipo de objeto.
+	var err error
+	switch typ {
+	case "CERTIFICATE":
+		_, err = x509.ParseCertificate(p.Bytes)
+	case "PUBLIC KEY":
+		_, err = x509.ParsePKIXPublicKey(p.Bytes)
+	case "CERTIFICATE REQUEST":
+		_, err = x509.ParseCertificateRequest(p.Bytes)
+	default:
+		// Cualquier otro tipo no está en la lista de públicos aceptados.
+		return false
+	}
+	return err == nil
+}
+
 // Analyze implementa Analyzer para Entropy.
 func (a Entropy) Analyze(path string, content []byte) []Finding {
 	// Los binarios (imágenes, ejecutables, zips...) son por naturaleza de
@@ -1061,7 +1191,19 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 
 	lines := bytes.Split(content, []byte("\n"))
 
+	// Bloques PEM (ver el bloque "Bloques PEM"). La mayoría de los archivos
+	// no tiene ninguno: el bytes.Contains evita recorrerlos dos veces. Si no
+	// hay PEM, pemSkip queda nil, y lo revisamos antes de indexarlo.
+	var pemSkip []bool
+	if bytes.Contains(content, []byte("-----BEGIN ")) {
+		pemSkip = pemSkipLines(lines)
+	}
+
 	for i, line := range lines {
+		if pemSkip != nil && pemSkip[i] {
+			continue
+		}
+
 		// Excepción SRI, condición 3: ¿la línea menciona "integrity"?
 		//
 		// Se calcula UNA vez por línea, no por token. bytes.ToLower crea una
@@ -1129,6 +1271,62 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 }
 
 // ---------------------------------------------------------------------------
+// PrivateKey: llaves privadas en el repositorio
+// ---------------------------------------------------------------------------
+
+// rePrivateKeyHeader reconoce la línea de inicio de una llave privada en
+// cualquier parte de la línea (no solo al inicio): así también detecta una
+// llave pegada dentro de un string en el código, como
+// const k = "-----BEGIN ..." seguido de "\n" escapados.
+var rePrivateKeyHeader = regexp.MustCompile(`-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?)-----`)
+
+// PrivateKey reporta llaves privadas en formato PEM (RSA, EC, OpenSSH,
+// PKCS#8, cifradas o PGP).
+//
+// Una llave privada en un repo es un problema aunque el repo no sea
+// malicioso: cualquiera que la clone puede firmar o descifrar en nombre de
+// su dueño. Por eso es High, y se reporta UNA vez por llave (en la línea
+// BEGIN), no una vez por línea de base64.
+//
+// No valida que la llave sea real: un encabezado de llave privada basta
+// para merecer una revisión. Una llave de ejemplo en un test también
+// aparecerá; para eso está el archivo de supresiones.
+type PrivateKey struct{}
+
+// Name devuelve el identificador de la regla: "private-key".
+func (PrivateKey) Name() string {
+	return "private-key"
+}
+
+// Analyze implementa Analyzer para PrivateKey.
+func (a PrivateKey) Analyze(path string, content []byte) []Finding {
+	if isBinary(content) {
+		return nil
+	}
+	// Atajo barato: sin "PRIVATE KEY" no hay nada que buscar.
+	if !bytes.Contains(content, []byte("PRIVATE KEY")) {
+		return nil
+	}
+
+	var findings []Finding
+	for i, line := range bytes.Split(content, []byte("\n")) {
+		// FindAllSubmatch: puede haber más de una llave en la misma línea
+		// (por ejemplo, un JSON con varias llaves en una línea).
+		for _, m := range rePrivateKeyHeader.FindAllSubmatch(line, -1) {
+			findings = append(findings, Finding{
+				Rule:     a.Name(),
+				File:     path,
+				Line:     i + 1,
+				Severity: High,
+				// m[0] es el texto completo; m[1], el primer grupo: el tipo.
+				Message: fmt.Sprintf("llave privada en el repositorio (%s)", m[1]),
+			})
+		}
+	}
+	return findings
+}
+
+// ---------------------------------------------------------------------------
 // Registro de analizadores
 // ---------------------------------------------------------------------------
 
@@ -1147,5 +1345,6 @@ func All() []Analyzer {
 		DownloadExec{},
 		InstallHooks{},
 		Entropy{},
+		PrivateKey{},
 	}
 }

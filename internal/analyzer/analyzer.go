@@ -65,26 +65,35 @@ type Finding struct {
 	// Coincide con el valor devuelto por Analyzer.Name() (por ejemplo
 	// "bidi-unicode" o "high-entropy"). Sirve para agrupar, filtrar o
 	// suprimir hallazgos por regla.
-	Rule string
+	//
+	// PASO 5: los struct tags `json:"..."` le dicen a encoding/json qué
+	// nombre usar para cada campo. Sin ellos, la clave sería "Rule" (el
+	// nombre del campo en Go, con mayúscula). Con ellos, "rule".
+	Rule string `json:"rule"`
 
 	// File es la ruta del archivo analizado, tal cual se le pasó a Analyze.
 	// El paquete no la normaliza: si el llamador pasa rutas relativas al
 	// repositorio, aquí aparecerán relativas.
-	File string
+	File string `json:"file"`
 
 	// Line es el número de línea (empezando en 1) donde se encontró el
 	// problema. El valor 0 tiene un significado especial: el hallazgo aplica
 	// al archivo completo y no a una línea concreta (es el caso de
 	// InstallHooks, que trabaja sobre el JSON ya parseado y no conoce las
 	// posiciones originales).
-	Line int
+	//
+	// PASO 5: ",omitempty" omite la clave del JSON cuando el valor es el
+	// valor cero (0 para int). Encaja con el significado de Line == 0
+	// ("aplica al archivo completo"): en vez de "line": 0, que podría
+	// leerse como una línea real, la clave simplemente no aparece.
+	Line int `json:"line,omitempty"`
 
 	// Severity es la gravedad estimada del hallazgo.
-	Severity Severity
+	Severity Severity `json:"severity"`
 
 	// Message es una descripción legible para humanos, en español, que
 	// explica qué se detectó.
-	Message string
+	Message string `json:"message"`
 }
 
 // Analyzer es la interfaz que deben implementar todos los analizadores.
@@ -127,6 +136,30 @@ const (
 	// o `curl | sh`). Debe revisarse antes de confiar en el repositorio.
 	High
 )
+
+// MarshalText implementa encoding.TextMarshaler. (PASO 5)
+//
+// Por qué no basta con String(): encoding/json NO usa fmt.Stringer. Para un
+// tipo basado en int, como Severity, por defecto escribe el número (3 en
+// vez de "high"). Antes de eso, json revisa si el tipo implementa alguna de
+// estas interfaces:
+//
+//   - json.Marshaler:          MarshalJSON() ([]byte, error)
+//   - encoding.TextMarshaler:  MarshalText() ([]byte, error)
+//
+// Elegimos TextMarshaler porque es más simple: devolvemos el texto "crudo"
+// (high) y json se encarga de ponerle comillas y escapar lo necesario. Con
+// MarshalJSON tendríamos que devolver el JSON ya armado, comillas incluidas
+// (`"high"`), y es fácil equivocarse.
+//
+// Bonus: TextMarshaler también lo usa encoding/xml, y encoding/json lo usa
+// para las claves de los maps (por ejemplo, un map[Severity]int).
+//
+// El receptor es por valor (s Severity, no *Severity) a propósito: así
+// funciona tanto con una Severity como con un puntero a Severity.
+func (s Severity) MarshalText() ([]byte, error) {
+	return []byte(s.String()), nil
+}
 
 // String implementa fmt.Stringer para que una Severity se imprima de forma
 // legible ("low", "medium", "high") en lugar de como número, tanto con

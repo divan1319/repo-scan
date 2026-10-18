@@ -35,6 +35,7 @@ package analyzer
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -683,6 +684,90 @@ func shannonEntropy(b []byte) float64 {
 	return entropy
 }
 
+// ---------------------------------------------------------------------------
+// Excepción SRI (Subresource Integrity)
+// ---------------------------------------------------------------------------
+//
+// Los lockfiles (package-lock.json, yarn.lock, pnpm-lock.yaml) y el atributo
+// integrity de HTML guardan hashes con este formato:
+//
+//	sha512-gJnl2DddbNolw5fU1cLC...o9HqQQ==
+//
+// Un hash es indistinguible de datos aleatorios, así que Entropy lo marcaría
+// siempre. Esta excepción los reconoce, pero de forma ESTRICTA, porque toda
+// excepción en una herramienta de seguridad es una puerta que el atacante
+// también puede usar. Se exigen tres condiciones (las dos primeras aquí, la
+// tercera en Analyze):
+//
+//  1. Algoritmo conocido, escrito en minúsculas.
+//  2. Base64 estándar válido que decodifica EXACTAMENTE al tamaño del hash.
+//     Así, "sha512-" delante de un payload de 2 KB no pasa: 64 bytes son muy
+//     poco espacio para algo útil.
+//  3. La palabra "integrity" en la misma línea.
+//
+// Limitación conocida: un payload partido en muchos trozos de 64 bytes, cada
+// uno en una línea con "integrity", y unido en tiempo de ejecución, no lo
+// detecta esta regla. Requiere más esfuerzo y deja otras huellas (el código
+// que une los trozos), pero conviene saberlo.
+
+// sriSizes asocia cada algoritmo con el tamaño de su hash en bytes.
+//
+// sha1 no es parte del estándar SRI (que define sha256, sha384 y sha512),
+// pero los package-lock.json antiguos de npm lo usan. Con MinLen = 40 nunca
+// llegaría a evaluarse ("sha1-" + 28 caracteres = 33), pero si alguien baja
+// MinLen, seguimos reconociéndolo.
+var sriSizes = map[string]int{
+	"sha1":   20,
+	"sha256": 32,
+	"sha384": 48,
+	"sha512": 64,
+}
+
+// integrityWord se compila una vez, igual que los regex: es un []byte que
+// reutilizamos en cada línea en vez de convertir el string cada vez.
+var integrityWord = []byte("integrity")
+
+// isSRIHash indica si tok tiene el formato exacto de un hash SRI:
+// <algoritmo>-<base64>, con el base64 del tamaño exacto del algoritmo.
+// No revisa el contexto (la palabra "integrity"): eso depende de la línea.
+func isSRIHash(tok []byte) bool {
+	// bytes.Cut separa en la PRIMERA aparición del separador y devuelve
+	// (antes, después, encontrado). Es más claro que bytes.SplitN(tok, "-", 2)
+	// y no reserva memoria para un slice de resultados.
+	//
+	// Si el base64 contuviera otro "-", queda en b64 y DecodeString lo
+	// rechaza más abajo ("-" no pertenece al base64 estándar).
+	algo, b64, found := bytes.Cut(tok, []byte("-"))
+	if !found {
+		return false
+	}
+
+	// string(algo) convierte []byte a string para buscar en el map. El
+	// compilador de Go optimiza este caso concreto (m[string(b)]) para no
+	// copiar memoria.
+	//
+	// "comma ok": si el algoritmo no está (sha999, SHA512...), ok es false.
+	want, ok := sriSizes[string(algo)]
+	if !ok {
+		return false
+	}
+
+	// StdEncoding es el base64 estándar (A-Z a-z 0-9 + /) CON relleno "=".
+	// DecodeString valida todo por nosotros: caracteres inválidos ("_", "-"),
+	// relleno faltante o mal puesto. Es más confiable que un regex propio.
+	//
+	// Ojo: existe base64.URLEncoding (usa - y _ en vez de + y /) y las
+	// variantes Raw* (sin relleno). SRI usa solo la estándar, así que
+	// aceptar las otras sería abrir la puerta sin necesidad.
+	decoded, err := base64.StdEncoding.DecodeString(string(b64))
+	if err != nil {
+		return false
+	}
+
+	// La condición que cierra el truco del prefijo falso.
+	return len(decoded) == want
+}
+
 // Analyze implementa Analyzer para Entropy.
 func (a Entropy) Analyze(path string, content []byte) []Finding {
 	// Los binarios (imágenes, ejecutables, zips...) son por naturaleza de
@@ -710,6 +795,15 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 	lines := bytes.Split(content, []byte("\n"))
 
 	for i, line := range lines {
+		// Excepción SRI, condición 3: ¿la línea menciona "integrity"?
+		//
+		// Se calcula UNA vez por línea, no por token. bytes.ToLower crea una
+		// copia en minúsculas (la línea original no se toca: recuerda que
+		// content se comparte con los demás analizadores). Así "Integrity"
+		// o "INTEGRITY" también cuentan, como en HTML, donde los atributos
+		// no distinguen mayúsculas.
+		hasIntegrity := bytes.Contains(bytes.ToLower(line), integrityWord)
+
 		// FindAll con n = -1 devuelve todas las coincidencias no solapadas
 		// de reToken en la línea, en orden de aparición.
 		tokens := reToken.FindAll(line, -1)
@@ -723,6 +817,18 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 			ent := shannonEntropy(tok)
 
 			if ent >= threshold {
+				// Excepción SRI. Va DENTRO del if, después de medir la
+				// entropía, por eficiencia: la gran mayoría de los tokens no
+				// llega aquí, así que solo decodificamos base64 cuando ya
+				// íbamos a reportar algo.
+				//
+				// Es un `continue`, no un `break`: saltamos ESTE token y
+				// seguimos con los demás de la línea. Si en la misma línea
+				// hay otro string sospechoso, se sigue evaluando.
+				if hasIntegrity && isSRIHash(tok) {
+					continue
+				}
+
 				findings = append(findings, Finding{
 					Rule:     a.Name(),
 					File:     path,

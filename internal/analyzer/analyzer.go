@@ -698,7 +698,7 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 					// Nota: el mensaje deliberadamente NO incluye el token,
 					// ya que podría ser un secreto real y acabaría expuesto
 					// en la salida/logs del escáner.
-					Message: fmt.Sprintf("cadena con alta entropía (%.2f) detectada: ", ent),
+					Message: fmt.Sprintf("cadena con alta entropía (%.2f) detectada", ent),
 				})
 
 				// Basta con un hallazgo por línea: se deja de evaluar el

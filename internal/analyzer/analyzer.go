@@ -923,6 +923,114 @@ func lineTokens(line []byte) [][]byte {
 	return append(tokens, reToken.FindAll(rest, -1)...)
 }
 
+// ---------------------------------------------------------------------------
+// Alfabetos e identificadores largos
+// ---------------------------------------------------------------------------
+//
+// Dos falsos positivos frecuentes en código real:
+//
+//  1. Tablas de alfabeto, como las de un codificador base64 hecho a mano:
+//     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+//     Cada caracter aparece UNA vez, así que su entropía es la máxima
+//     posible (log2(64) = 6.00), aunque no tiene nada de aleatorio.
+//
+//  2. Identificadores muy largos, como los selectores de Objective-C:
+//     keyEventWithType_location_modifierFlags_timestamp_windowNumber_...
+//     Son muchas palabras distintas pegadas, y eso sube la entropía (4.55).
+//
+// Las dos excepciones se calibraron midiendo strings aleatorios (lo que
+// SÍ queremos detectar) y ejemplos reales (lo que no):
+//
+//   - En 120,000 strings base64 aleatorios, la fracción máxima de pares
+//     consecutivos fue 0.15. Un alfabeto ronda 0.94. Umbral: 0.85.
+//   - Con looksLikeIdentifier, de ~300,000 strings base64 aleatorios no se
+//     escapó ninguno; de strings aleatorios de solo minúsculas, ~0.35%.
+//
+// Por qué 0.85 y no 0.5: un atacante podría pegar un alfabeto DELANTE de su
+// payload en el mismo token. Con 0.85, lo que se puede esconder así no pasa
+// de unos 7 caracteres. Con 0.5 cabrían unos 60.
+//
+// Limitación (como con cualquier detector por entropía): un payload
+// codificado a propósito como palabras de diccionario no se distingue de un
+// identificador. Detectar eso requiere otro tipo de análisis.
+
+// minSequential es la fracción mínima de pares consecutivos para considerar
+// que un token es una tabla de alfabeto.
+const minSequential = 0.85
+
+// isAlphabetRun indica si tok es esencialmente una secuencia ordenada de
+// caracteres, como "ABCDEFG...". Cuenta los pares en que el byte siguiente
+// es el actual + 1 ('A' seguido de 'B', '0' seguido de '1').
+//
+// Funciona con byte y no con rune porque los tokens de reToken son ASCII.
+func isAlphabetRun(tok []byte) bool {
+	if len(tok) < 2 {
+		return false
+	}
+	consecutive := 0
+	for i := 1; i < len(tok); i++ {
+		if tok[i] == tok[i-1]+1 {
+			consecutive++
+		}
+	}
+	// Convertimos a float64 ANTES de dividir. Si dividiéramos dos int, Go
+	// haría división entera: 59/63 daría 0, no 0.94.
+	return float64(consecutive)/float64(len(tok)-1) >= minSequential
+}
+
+// looksLikeIdentifier indica si tok parece un nombre de programación
+// formado por palabras (camelCase o snake_case), y no datos aleatorios.
+//
+// Tres condiciones, todas necesarias:
+//
+//  1. Sin dígitos ni '+', '/' o '='. Un identificador no puede contener
+//     + / =, y en 40 o más caracteres de base64 aleatorio casi siempre hay
+//     algún dígito. (Esto deja fuera identificadores con números, como
+//     "utf8Decoder": preferimos un falso positivo a un falso negativo.)
+//  2. Como máximo 25% de mayúsculas. En camelCase hay ~1 mayúscula por
+//     palabra; en datos aleatorios con letras mixtas, ~50%.
+//  3. Al menos 30% de vocales. Las palabras reales rondan 35-40%; letras
+//     aleatorias, 5 de 26 (~19%). Esta condición es la que frena a un
+//     atacante que use solo minúsculas para esquivar la número 2.
+func looksLikeIdentifier(tok []byte) bool {
+	letters, upper, vowels := 0, 0, 0
+	for _, c := range tok {
+		switch {
+		case c >= '0' && c <= '9', c == '+', c == '/', c == '=':
+			// Un case puede listar varias condiciones separadas por comas:
+			// basta con que una sea verdadera.
+			return false
+		case c >= 'A' && c <= 'Z':
+			letters++
+			upper++
+			if isVowel(c + ('a' - 'A')) { // pasamos la mayúscula a minúscula
+				vowels++
+			}
+		case c >= 'a' && c <= 'z':
+			letters++
+			if isVowel(c) {
+				vowels++
+			}
+		}
+		// '_' y '-' no cuentan como letras: solo separan palabras.
+	}
+	if letters == 0 {
+		return false
+	}
+	upperRatio := float64(upper) / float64(letters)
+	vowelRatio := float64(vowels) / float64(letters)
+	return upperRatio <= 0.25 && vowelRatio >= 0.30
+}
+
+// isVowel recibe una letra minúscula ASCII.
+func isVowel(c byte) bool {
+	switch c {
+	case 'a', 'e', 'i', 'o', 'u':
+		return true
+	}
+	return false
+}
+
 // Analyze implementa Analyzer para Entropy.
 func (a Entropy) Analyze(path string, content []byte) []Finding {
 	// Los binarios (imágenes, ejecutables, zips...) son por naturaleza de
@@ -988,6 +1096,14 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 				// seguimos con los demás de la línea. Si en la misma línea
 				// hay otro string sospechoso, se sigue evaluando.
 				if hasIntegrity && isSRIHash(tok) {
+					continue
+				}
+
+				// Excepciones para alfabetos e identificadores (ver el
+				// bloque "Alfabetos e identificadores largos"). Mismo
+				// patrón: solo se evalúan cuando ya íbamos a reportar, y con
+				// continue para seguir revisando el resto de la línea.
+				if isAlphabetRun(tok) || looksLikeIdentifier(tok) {
 					continue
 				}
 

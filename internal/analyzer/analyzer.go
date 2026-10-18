@@ -39,8 +39,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/url"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 // Severity indica qué tan grave es un hallazgo.
@@ -768,6 +770,159 @@ func isSRIHash(tok []byte) bool {
 	return len(decoded) == want
 }
 
+// sriFiles son los archivos donde un hash SRI es legítimo, además de HTML.
+//
+// Excepción SRI, condición 4: la excepción solo vale en estos archivos. En
+// un .js, .py o .sh, un hash con la palabra "integrity" no tiene por qué
+// aparecer, y si la excepción valiera ahí, un atacante podría partir un
+// payload en trozos de 64 bytes con formato de hash, uno por línea, y unirlos
+// en tiempo de ejecución. En un lockfile podría esconderlos igual, pero un
+// lockfile no se ejecuta: necesitaría código aparte que lo lea y lo
+// decodifique, y ese código sí queda expuesto a los demás analizadores.
+var sriFiles = map[string]bool{
+	"package-lock.json":   true,
+	"npm-shrinkwrap.json": true,
+	"yarn.lock":           true,
+	"pnpm-lock.yaml":      true,
+}
+
+// allowsSRI indica si en el archivo path se aceptan hashes SRI.
+func allowsSRI(path string) bool {
+	// Mismo criterio que InstallHooks: nombre base EXACTO. Así
+	// "package-lock.json.bak" o "my-package-lock.json" no cuentan.
+	base := filepath.Base(path)
+	if sriFiles[base] {
+		return true
+	}
+	// En HTML, por el atributo integrity de <script> y <link>. La extensión
+	// se compara en minúsculas: "INDEX.HTML" también es HTML.
+	switch strings.ToLower(filepath.Ext(base)) {
+	case ".html", ".htm":
+		return true
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// URLs: se analizan por partes
+// ---------------------------------------------------------------------------
+//
+// El problema: "/" pertenece al alfabeto de base64, así que reToken toma una
+// URL como un solo token gigante. En
+//
+//	https://api.github.com/repos/theseer/tokenizer/zipball/7989e43bf381...
+//
+// el token "com/repos/theseer/tokenizer/zipball/7989e43bf381..." mide 76
+// caracteres y su entropía (4.53) supera el umbral, aunque cada pieza por
+// separado es inofensiva (el hash de commit es hexadecimal: máximo 4.0).
+//
+// ¿Por qué no simplemente cortar los tokens en cada "/"? Porque hay secretos
+// legítimamente detectables que contienen "/", como una clave secreta de AWS
+// (40 caracteres en base64, por ejemplo "wJalrXUtnFEMI/K7MDENG/bPxRf..."). Si
+// cortáramos en "/", quedaría en trozos cortos y dejaríamos de verla.
+//
+// La solución: solo DENTRO de una URL, "/" separa piezas. Cada etiqueta del
+// dominio, cada segmento de la ruta y cada clave y valor del query se evalúa
+// por separado. Lo que está fuera de las URLs se tokeniza como siempre.
+//
+// Lo que se sigue detectando:
+//   - un payload en un valor del query: https://x/c?d=<base64>
+//   - un payload en un segmento de la ruta: https://x/<base64url>
+//   - datos codificados en un subdominio (exfiltración por DNS)
+//
+// Limitación: un payload en base64 ESTÁNDAR dentro de la ruta (con "/") queda
+// partido en segmentos y puede pasar si cada trozo mide menos que MinLen. En
+// la práctica, los datos dentro de una ruta se codifican en base64url (sin
+// "/"), justamente porque "/" rompe la ruta.
+
+// reURL encuentra URLs http y https dentro de una línea.
+//
+// La URL termina en el primer caracter que normalmente la delimita en código
+// o en texto: espacios, comillas, <, >, paréntesis, corchetes, llaves o
+// backtick. Es una heurística, no un parser completo de URLs, y está bien
+// así: si se equivoca por un caracter, el resto de la línea igual se analiza.
+//
+// Sobre la sintaxis: los regex se escriben en raw strings (`...`) para no
+// duplicar cada "\". Pero un raw string no puede contener un backtick, así
+// que el backtick se concatena aparte, como string normal: "`".
+var reURL = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>()\[\]{}` + "`" + `]+`)
+
+// urlTokens divide una URL en piezas para evaluarlas por separado.
+func urlTokens(raw []byte) [][]byte {
+	u, err := url.Parse(string(raw))
+	if err != nil {
+		// Si la URL no se puede interpretar (por ejemplo, un "%zz" inválido),
+		// NO la descartamos: la tratamos como texto normal. Descartarla sería
+		// una evasión gratis: bastaría con meter un error de sintaxis en la
+		// URL para que su contenido no se analice.
+		return reToken.FindAll(raw, -1)
+	}
+
+	var parts [][]byte
+
+	// add tokeniza un pedazo y acumula los tokens. Es una closure: una
+	// función anónima que "captura" la variable parts del ámbito exterior y
+	// puede modificarla. Evita repetir la misma línea cinco veces.
+	add := func(piece string) {
+		parts = append(parts, reToken.FindAll([]byte(piece), -1)...)
+	}
+
+	// Hostname() devuelve el dominio sin puerto. Cada etiqueta por separado:
+	// "<datos>.exfil.example" deja <datos> como su propio token.
+	for _, label := range strings.Split(u.Hostname(), ".") {
+		add(label)
+	}
+
+	// EscapedPath() devuelve la ruta tal como venía (con %XX), sin
+	// decodificar. Así no convertimos %2F en "/" ni alteramos el contenido.
+	for _, seg := range strings.Split(u.EscapedPath(), "/") {
+		add(seg)
+	}
+
+	// RawQuery es el texto después de "?", sin decodificar. Usamos RawQuery
+	// y no u.Query() a propósito: Query() convierte "+" en espacio (la regla
+	// de los formularios HTML), y "+" es un caracter de base64. Con Query(),
+	// un payload en base64 quedaría cortado en cada "+".
+	for _, pair := range strings.Split(u.RawQuery, "&") {
+		key, value, _ := strings.Cut(pair, "=")
+		add(key)
+		add(value)
+	}
+
+	// El fragmento (después de "#") también puede llevar rutas, por ejemplo
+	// en aplicaciones de una sola página: "#/usuarios/42".
+	for _, seg := range strings.Split(u.Fragment, "/") {
+		add(seg)
+	}
+
+	return parts
+}
+
+// lineTokens devuelve los tokens de una línea: las URLs por partes y el
+// resto del texto con reToken.
+func lineTokens(line []byte) [][]byte {
+	// Atajo: la mayoría de las líneas no tienen URLs. bytes.Contains es mucho
+	// más barato que el regex, así que lo usamos como filtro previo.
+	if !bytes.Contains(line, []byte("://")) {
+		return reToken.FindAll(line, -1)
+	}
+
+	var tokens [][]byte
+	for _, u := range reURL.FindAll(line, -1) {
+		tokens = append(tokens, urlTokens(u)...)
+	}
+
+	// Reemplazamos cada URL por un espacio para tokenizar lo que queda sin
+	// volver a ver las URLs. El espacio (y no "") importa: sin él, el texto
+	// de antes y de después de la URL podría quedar pegado y formar un token
+	// que no existía en la línea original.
+	//
+	// ReplaceAll devuelve un slice NUEVO: line (que se comparte con los demás
+	// analizadores) no se modifica.
+	rest := reURL.ReplaceAll(line, []byte(" "))
+	return append(tokens, reToken.FindAll(rest, -1)...)
+}
+
 // Analyze implementa Analyzer para Entropy.
 func (a Entropy) Analyze(path string, content []byte) []Finding {
 	// Los binarios (imágenes, ejecutables, zips...) son por naturaleza de
@@ -792,6 +947,10 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 
 	var findings []Finding
 
+	// Excepción SRI, condición 4: ¿este archivo admite hashes SRI? Depende
+	// solo del nombre del archivo, así que se calcula UNA vez, no por línea.
+	sriAllowed := allowsSRI(path)
+
 	lines := bytes.Split(content, []byte("\n"))
 
 	for i, line := range lines {
@@ -802,11 +961,14 @@ func (a Entropy) Analyze(path string, content []byte) []Finding {
 		// content se comparte con los demás analizadores). Así "Integrity"
 		// o "INTEGRITY" también cuentan, como en HTML, donde los atributos
 		// no distinguen mayúsculas.
-		hasIntegrity := bytes.Contains(bytes.ToLower(line), integrityWord)
+		//
+		// El && corta la evaluación: en archivos que no admiten SRI ni
+		// siquiera buscamos la palabra.
+		hasIntegrity := sriAllowed && bytes.Contains(bytes.ToLower(line), integrityWord)
 
-		// FindAll con n = -1 devuelve todas las coincidencias no solapadas
-		// de reToken en la línea, en orden de aparición.
-		tokens := reToken.FindAll(line, -1)
+		// lineTokens separa las URLs en piezas y tokeniza el resto con
+		// reToken (ver el bloque "URLs: se analizan por partes").
+		tokens := lineTokens(line)
 		for _, tok := range tokens {
 			// Filtro barato primero: descartar tokens cortos antes de
 			// calcular la entropía.
